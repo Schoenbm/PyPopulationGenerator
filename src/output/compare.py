@@ -1,144 +1,202 @@
-"""Comparison between Filosofi-based and IRIS-based population allocations."""
+"""Validation de l'allocation Filosofi par rapport aux données IRIS 2022.
+
+Méthode :
+  1. Jointure spatiale : chaque bâtiment → IRIS qui le contient
+  2. Agrégation : somme de population_allouee par IRIS
+  3. Comparaison : pop_agregee_filosofi vs Ind_total (P22_POP) de l'IRIS
+"""
 
 import logging
 from pathlib import Path
 
+import contextily as ctx
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as mcm
 import pandas as pd
-import contextily as ctx
 
 logger = logging.getLogger(__name__)
 
-_OUTPUT_CSV = "comparison.csv"
-_OUTPUT_MAP = "comparison_map.png"
+_OUTPUT_CSV = "validation.csv"
+_OUTPUT_MAP = "validation_map.png"
 _DPI = 150
 
 
 def compare_results(
     result_filosofi: gpd.GeoDataFrame,
-    result_iris: gpd.GeoDataFrame,
+    iris: gpd.GeoDataFrame,
     output_dir: str | Path,
 ) -> Path:
-    """Compare two population allocation results and export CSV + map.
+    """Valide l'allocation Filosofi en agrégeant par IRIS et comparant à P22_POP.
 
-    Merges on building ID, computes difference (IRIS - Filosofi), and produces:
-    - comparison.csv : building-level comparison table
-    - comparison_map.png : choropleth of the absolute difference
+    Pour chaque IRIS :
+      - pop_filosofi  : somme de population_allouee des bâtiments dans l'IRIS
+      - pop_iris_2022 : Ind_total du loader IRIS (= P22_POP recensement 2022)
+      - diff          : pop_filosofi - pop_iris_2022
+      - erreur_rel    : diff / pop_iris_2022 × 100  (%)
+
+    Produit :
+      - validation.csv     : table de validation par IRIS
+      - validation_map.png : carte choroplèthe de l'erreur relative
 
     Args:
-        result_filosofi: GeoDataFrame from Filosofi pipeline (population_allouee).
-        result_iris:     GeoDataFrame from IRIS pipeline (population_allouee).
-        output_dir:      Directory where outputs are written.
+        result_filosofi : GeoDataFrame bâtiments avec population_allouee.
+        iris            : GeoDataFrame IRIS avec Ind_total (P22_POP 2022).
+        output_dir      : Répertoire de sortie.
 
     Returns:
-        Path to the comparison CSV.
+        Path vers le CSV de validation.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Merge on building ID ──────────────────────────────────────────────────
-    left = result_filosofi[["ID", "geometry", "population_allouee"]].rename(
-        columns={"population_allouee": "pop_filosofi"}
-    )
-    right = result_iris[["ID", "population_allouee"]].rename(
-        columns={"population_allouee": "pop_iris"}
-    )
-    merged = left.merge(right, on="ID", how="inner")
-    merged["diff"] = merged["pop_iris"] - merged["pop_filosofi"]
-    merged["diff_abs"] = merged["diff"].abs()
+    # ── 1. Aligner les CRS ────────────────────────────────────────────────────
+    if result_filosofi.crs != iris.crs:
+        result_filosofi = result_filosofi.to_crs(iris.crs)
 
-    # ── Summary stats ─────────────────────────────────────────────────────────
+    # ── 2. Jointure bâtiments → IRIS (centroïde) ─────────────────────────────
+    centroids = result_filosofi.copy()
+    centroids["geometry"] = result_filosofi.geometry.centroid
+
+    joined = gpd.sjoin(
+        centroids[["population_allouee", "geometry"]],
+        iris[["CODE_IRIS", "geometry"]],
+        how="left",
+        predicate="within",
+    )
+
+    n_unmatched = joined["CODE_IRIS"].isna().sum()
+    if n_unmatched > 0:
+        logger.warning("%d bâtiments hors IRIS ignorés dans la validation", n_unmatched)
+
+    # ── 3. Agrégation par IRIS ────────────────────────────────────────────────
+    agg = (
+        joined.dropna(subset=["CODE_IRIS"])
+        .groupby("CODE_IRIS", as_index=False)["population_allouee"]
+        .sum()
+        .rename(columns={"population_allouee": "pop_filosofi"})
+    )
+
+    # ── 4. Fusion avec données IRIS 2022 ──────────────────────────────────────
+    iris_stats = iris[["CODE_IRIS", "Ind_total", "geometry"]].rename(
+        columns={"Ind_total": "pop_iris_2022"}
+    )
+    merged = iris_stats.merge(agg, on="CODE_IRIS", how="left")
+    merged["pop_filosofi"] = merged["pop_filosofi"].fillna(0)
+
+    # ── 5. Métriques ──────────────────────────────────────────────────────────
+    merged["diff"] = merged["pop_filosofi"] - merged["pop_iris_2022"]
+    has_pop = merged["pop_iris_2022"] > 0
+    merged["erreur_rel"] = 0.0
+    merged.loc[has_pop, "erreur_rel"] = (
+        merged.loc[has_pop, "diff"] / merged.loc[has_pop, "pop_iris_2022"] * 100
+    )
+
+    # ── 6. Résumé ─────────────────────────────────────────────────────────────
     n = len(merged)
-    mae = merged["diff_abs"].mean()
-    corr = merged[["pop_filosofi", "pop_iris"]].corr().iloc[0, 1]
-    same = (merged["diff"] == 0).sum()
+    n_pop = has_pop.sum()
+    mae = merged.loc[has_pop, "diff"].abs().mean()
+    mape = merged.loc[has_pop, "erreur_rel"].abs().mean()
+    corr = merged.loc[has_pop, ["pop_filosofi", "pop_iris_2022"]].corr().iloc[0, 1]
+    total_filosofi = merged["pop_filosofi"].sum()
+    total_iris = merged["pop_iris_2022"].sum()
 
-    logger.info("=== COMPARAISON FILOSOFI vs IRIS ===")
-    logger.info("Bâtiments comparés       : %d", n)
-    logger.info("Identiques               : %d (%.1f%%)", same, same / n * 100)
-    logger.info("Erreur absolue moyenne   : %.2f hab/bâtiment", mae)
-    logger.info("Corrélation              : %.4f", corr)
+    logger.info("=== VALIDATION FILOSOFI vs IRIS 2022 ===")
+    logger.info("IRIS comparés              : %d (dont %d avec pop > 0)", n, n_pop)
+    logger.info("Population totale Filosofi : %d", int(total_filosofi))
+    logger.info("Population totale IRIS     : %d", int(total_iris))
+    logger.info("Écart total                : %+d (%.1f%%)",
+                int(total_filosofi - total_iris),
+                (total_filosofi - total_iris) / total_iris * 100 if total_iris else 0)
+    logger.info("Erreur absolue moyenne     : %.1f hab/IRIS", mae)
+    logger.info("Erreur relative moyenne    : %.1f%%", mape)
+    logger.info("Corrélation                : %.4f", corr)
     logger.info(
-        "Différence totale nette  : %+.0f hab (IRIS - Filosofi)",
-        merged["diff"].sum(),
+        "IRIS les plus sous-estimés (Filosofi < IRIS 2022) :\n%s",
+        merged.nsmallest(5, "diff")[["CODE_IRIS", "pop_filosofi", "pop_iris_2022", "diff", "erreur_rel"]]
+        .to_string(index=False),
     )
     logger.info(
-        "Top 5 écarts absolus :\n%s",
-        merged.nlargest(5, "diff_abs")[["ID", "pop_filosofi", "pop_iris", "diff"]]
+        "IRIS les plus sur-estimés (Filosofi > IRIS 2022) :\n%s",
+        merged.nlargest(5, "diff")[["CODE_IRIS", "pop_filosofi", "pop_iris_2022", "diff", "erreur_rel"]]
         .to_string(index=False),
     )
 
-    # ── CSV export ────────────────────────────────────────────────────────────
+    # ── 7. Export CSV ─────────────────────────────────────────────────────────
     csv_path = output_dir / _OUTPUT_CSV
     merged.drop(columns=["geometry"]).to_csv(csv_path, index=False)
-    logger.info("CSV comparaison : %s", csv_path)
+    logger.info("CSV validation : %s", csv_path)
 
-    # ── Map ───────────────────────────────────────────────────────────────────
-    _make_diff_map(merged, output_dir / _OUTPUT_MAP)
+    # ── 8. Carte ──────────────────────────────────────────────────────────────
+    _make_validation_map(merged, output_dir / _OUTPUT_MAP)
 
     return csv_path
 
 
-def _make_diff_map(merged: gpd.GeoDataFrame, out_path: Path) -> None:
-    """Choropleth map of (pop_iris - pop_filosofi) per building."""
+def _make_validation_map(merged: gpd.GeoDataFrame, out_path: Path) -> None:
+    """Carte choroplèthe de l'erreur relative par IRIS."""
     gdf = merged.to_crs(epsg=3857)
 
-    # Diverging colormap centred on 0
-    vmax = max(1, int(gdf["diff"].abs().quantile(0.99)))
+    vmax = min(100, float(gdf["erreur_rel"].abs().quantile(0.95)))
     cmap = plt.get_cmap("RdBu_r")
     norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 10))
+    fig, axes = plt.subplots(1, 2, figsize=(22, 10))
 
-    for ax, col, title, cmap_local, norm_local in [
-        (
-            axes[0],
-            "pop_filosofi",
-            "Filosofi 2019 (carreaux 200m)",
-            mcolors.LinearSegmentedColormap.from_list(
-                "pop", ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
-            ),
-            mcolors.Normalize(vmin=0, vmax=int(gdf["pop_filosofi"].quantile(0.99))),
-        ),
-        (
-            axes[1],
-            "pop_iris",
-            "INSEE RP 2022 (IRIS)",
-            mcolors.LinearSegmentedColormap.from_list(
-                "pop", ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
-            ),
-            mcolors.Normalize(vmin=0, vmax=int(gdf["pop_iris"].quantile(0.99))),
-        ),
-    ]:
-        zero = gdf[gdf[col] == 0]
-        nonzero = gdf[gdf[col] > 0].copy()
+    # ── Panneau gauche : populations absolues côte à côte ────────────────────
+    ax_abs = axes[0]
+    vmax_pop = int(gdf[["pop_filosofi", "pop_iris_2022"]].max().max())
+    cmap_pop = mcolors.LinearSegmentedColormap.from_list(
+        "pop", ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
+    )
+    norm_pop = mcolors.Normalize(vmin=0, vmax=vmax_pop)
 
-        if not zero.empty:
-            zero.plot(ax=ax, color="#cccccc", edgecolor="#999999", linewidth=0.2)
-        if not nonzero.empty:
-            nonzero["_color"] = nonzero[col].clip(
-                upper=int(gdf[col].quantile(0.99))
-            ).apply(lambda v: mcolors.to_hex(cmap_local(norm_local(v))))
-            nonzero.plot(ax=ax, color=nonzero["_color"].tolist(),
-                         edgecolor="#555555", linewidth=0.2)
+    gdf["_color_abs"] = gdf["pop_filosofi"].apply(
+        lambda v: mcolors.to_hex(cmap_pop(norm_pop(v)))
+    )
+    gdf.plot(ax=ax_abs, color=gdf["_color_abs"].tolist(),
+             edgecolor="#555555", linewidth=0.3)
+    ctx.add_basemap(ax_abs, source=ctx.providers.CartoDB.Positron, zoom="auto")
+    sm_abs = mcm.ScalarMappable(cmap=cmap_pop, norm=norm_pop)
+    sm_abs.set_array([])
+    fig.colorbar(sm_abs, ax=ax_abs, fraction=0.025, pad=0.02).set_label(
+        "Population (Filosofi agrégé)", fontsize=10
+    )
+    ax_abs.set_axis_off()
+    ax_abs.set_title("Population Filosofi agrégée par IRIS", fontsize=12, pad=8)
 
-        ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron, zoom="auto")
-        sm = mcm.ScalarMappable(cmap=cmap_local, norm=norm_local)
-        sm.set_array([])
-        fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02).set_label(
-            "Population estimée", fontsize=10
+    # ── Panneau droit : erreur relative ──────────────────────────────────────
+    ax_err = axes[1]
+    has_pop = gdf["pop_iris_2022"] > 0
+    no_pop = gdf[~has_pop]
+    with_pop = gdf[has_pop].copy()
+
+    if not no_pop.empty:
+        no_pop.plot(ax=ax_err, color="#cccccc", edgecolor="#999999", linewidth=0.3)
+    if not with_pop.empty:
+        with_pop["_color_err"] = with_pop["erreur_rel"].clip(-vmax, vmax).apply(
+            lambda v: mcolors.to_hex(cmap(norm(v)))
         )
-        ax.set_axis_off()
-        ax.set_title(title, fontsize=12, pad=8)
+        with_pop.plot(ax=ax_err, color=with_pop["_color_err"].tolist(),
+                      edgecolor="#555555", linewidth=0.3)
+
+    ctx.add_basemap(ax_err, source=ctx.providers.CartoDB.Positron, zoom="auto")
+    sm_err = mcm.ScalarMappable(cmap=cmap, norm=norm)
+    sm_err.set_array([])
+    fig.colorbar(sm_err, ax=ax_err, fraction=0.025, pad=0.02).set_label(
+        "Erreur relative (%)", fontsize=10
+    )
+    ax_err.set_axis_off()
+    ax_err.set_title(
+        "Erreur relative Filosofi vs IRIS 2022\n(bleu = sous-estimation, rouge = sur-estimation)",
+        fontsize=12, pad=8,
+    )
 
     fig.suptitle(
-        "Comparaison des allocations de population — Métropole grenobloise",
-        fontsize=14,
-        y=1.01,
+        "Validation de l'allocation Filosofi — Métropole grenobloise",
+        fontsize=14, y=1.01,
     )
     fig.savefig(out_path, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Carte comparaison : %s", out_path)
+    logger.info("Carte validation : %s", out_path)

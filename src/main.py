@@ -147,7 +147,7 @@ def step_visualize(verbose: bool = False, source: str = "filosofi") -> None:
 
 
 def step_compare(verbose: bool = False, source: str = "filosofi") -> None:
-    """Compare Filosofi vs IRIS allocation results."""
+    """Validate Filosofi allocation against IRIS 2022 census data."""
     import logging
     _setup_logging(verbose)
     log = logging.getLogger(__name__)
@@ -157,13 +157,13 @@ def step_compare(verbose: bool = False, source: str = "filosofi") -> None:
 
     log.info("=== STEP compare ===")
     _require(RESULT_FILOSOFI_GPKG, "match --source filosofi")
-    _require(RESULT_IRIS_GPKG, "match --source iris")
+    _require(IRIS_GPKG, "load --source iris")
 
     result_filosofi = gpd.read_file(RESULT_FILOSOFI_GPKG)
-    result_iris = gpd.read_file(RESULT_IRIS_GPKG)
+    iris = gpd.read_file(IRIS_GPKG)
 
-    out = compare_results(result_filosofi, result_iris, PROCESSED_DIR / "compare")
-    log.info("Comparaison terminée : %s", out)
+    out = compare_results(result_filosofi, iris, PROCESSED_DIR / "compare")
+    log.info("Validation terminée : %s", out)
 
 
 def step_all(verbose: bool = False, source: str = "filosofi") -> None:
