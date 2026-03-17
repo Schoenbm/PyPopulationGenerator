@@ -1,0 +1,12 @@
+data/processed/
+data/*.shp
+data/*.dbf
+data/*.shx
+data/*.prj
+data/*.cpg
+data/*.qmd
+data/Qgis/
+__pycache__/
+*.pyc
+*.pyo
+.env
