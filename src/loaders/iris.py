@@ -1,7 +1,7 @@
 """Loader for IRIS geographic boundaries + INSEE 2022 census data.
 
 Downloads automatically from IGN and INSEE if not already cached in data/cache/.
-Filters to a single department (default: Isère, code "38").
+Filters by commune codes (preferred) or department code fallback.
 """
 
 import logging
@@ -69,14 +69,17 @@ def _extract_contours_7z(archive: Path, extract_dir: Path) -> Path:
                 "py7zr est nécessaire pour extraire les contours IRIS.\n"
                 "Installez-le avec : pip install py7zr"
             ) from e
-        logger.info("Extraction de l'archive 7z (peut prendre une minute)…")
+        logger.info("Extraction de l'archive 7z (peut prendre une minute)...")
         with py7zr.SevenZipFile(archive, mode="r") as z:
             z.extractall(path=extract_dir)
         logger.info("Extraction terminée dans %s", extract_dir)
 
-    shp_files = list(extract_dir.rglob("*.shp"))
+    # Chercher CONTOURS-IRIS.shp en priorité (ignorer EMPRISE.shp)
+    shp_files = [p for p in extract_dir.rglob("*.shp") if p.stem == "CONTOURS-IRIS"]
     if not shp_files:
-        raise FileNotFoundError(f"Aucun fichier .shp trouvé dans {extract_dir}")
+        shp_files = [p for p in extract_dir.rglob("*.shp") if p.stem != "EMPRISE"]
+    if not shp_files:
+        raise FileNotFoundError(f"Aucun fichier CONTOURS-IRIS.shp trouvé dans {extract_dir}")
     return shp_files[0]
 
 
@@ -84,7 +87,10 @@ def _load_csv_from_zip(url: str, cache_name: str, dep_code: str) -> pd.DataFrame
     """Download ZIP containing a CSV, return as DataFrame filtered to dep_code."""
     archive = _download(url, _CACHE_DIR / cache_name)
     with zipfile.ZipFile(archive) as z:
-        csv_name = next(n for n in z.namelist() if n.endswith(".csv"))
+        csv_name = next(
+            n for n in z.namelist()
+            if n.lower().endswith(".csv") and not n.lower().startswith("meta")
+        )
         with z.open(csv_name) as f:
             df = pd.read_csv(f, sep=";", dtype={"IRIS": str}, low_memory=False)
     df = df[df["IRIS"].str.startswith(dep_code)].copy()
@@ -94,20 +100,26 @@ def _load_csv_from_zip(url: str, cache_name: str, dep_code: str) -> pd.DataFrame
 
 # ── Public loader ─────────────────────────────────────────────────────────────
 
-def load_iris(dep_code: str = _DEFAULT_DEP) -> gpd.GeoDataFrame:
-    """Load IRIS geometries + 2022 census population for a department.
+def load_iris(
+    commune_codes: list[str] | None = None,
+    dep_code: str = _DEFAULT_DEP,
+) -> gpd.GeoDataFrame:
+    """Load IRIS geometries + 2022 census population.
 
     Downloads and caches data automatically from IGN and INSEE.
     Returns a GeoDataFrame compatible with the existing pipeline:
-    - geometry    : IRIS polygon (Lambert-93 / EPSG:2154)
-    - Ind_total   : total population (P22_POP) — drop-in replacement for Filosofi
+    - geometry          : IRIS polygon (Lambert-93 / EPSG:2154)
+    - Ind_total         : total population (P22_POP)
     - taille_moy_menage : average household size (P22_POP / P22_MEN)
 
     Args:
-        dep_code: INSEE department code prefix (default "38" = Isère).
+        commune_codes: Liste de codes INSEE commune (ex. ["38185", "38151"]).
+                       Si fournie, filtre les IRIS de ces communes uniquement.
+                       Si absente, filtre par dep_code (département entier).
+        dep_code:      Code département de secours (default "38" = Isère).
 
     Returns:
-        GeoDataFrame with one row per IRIS, columns Ind_total and taille_moy_menage.
+        GeoDataFrame avec une ligne par IRIS.
     """
     # 1. Contours IRIS (IGN, 2024)
     archive = _download(_CONTOURS_URL, _CACHE_DIR / "contours-iris-2024.7z")
@@ -116,12 +128,18 @@ def load_iris(dep_code: str = _DEFAULT_DEP) -> gpd.GeoDataFrame:
     gdf = gpd.read_file(shp_path)
     logger.info("CONTOURS-IRIS chargés : %d IRIS (France entière)", len(gdf))
 
-    gdf = gdf[gdf["CODE_IRIS"].str.startswith(dep_code)].copy()
-    logger.info("Filtré dept %s : %d IRIS", dep_code, len(gdf))
+    if commune_codes:
+        gdf = gdf[gdf["INSEE_COM"].isin(commune_codes)].copy()
+        logger.info("Filtré sur %d communes : %d IRIS", len(commune_codes), len(gdf))
+    else:
+        gdf = gdf[gdf["CODE_IRIS"].str.startswith(dep_code)].copy()
+        logger.info("Filtré dept %s : %d IRIS", dep_code, len(gdf))
 
     # 2. Population par IRIS (INSEE RP 2022)
-    pop = _load_csv_from_zip(_POP_URL, "base-ic-pop-2022.zip", dep_code)
-    log = _load_csv_from_zip(_LOG_URL, "base-ic-logement-2022.zip", dep_code)
+    # Toujours filtrer par dept pour le CSV (plus simple et suffisant)
+    csv_dep = commune_codes[0][:2] if commune_codes else dep_code
+    pop = _load_csv_from_zip(_POP_URL, "base-ic-pop-2022.zip", csv_dep)
+    log = _load_csv_from_zip(_LOG_URL, "base-ic-logement-2022.zip", csv_dep)
 
     # 3. Fusion des tables statistiques
     stats = pop[["IRIS", "P22_POP", "P22_PMEN"]].merge(

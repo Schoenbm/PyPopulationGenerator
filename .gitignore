@@ -6,6 +6,8 @@ data/*.prj
 data/*.cpg
 data/*.qmd
 data/Qgis/
+data/cache/
+genstar*/
 __pycache__/
 *.pyc
 *.pyo

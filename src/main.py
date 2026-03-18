@@ -1,14 +1,15 @@
 """Pipeline CLI — distribue la population INSEE aux bâtiments résidentiels.
 
 Usage:
-    python src/main.py --step all                        # pipeline complet (Filosofi)
-    python src/main.py --step all --source iris          # pipeline complet (IRIS 2022)
-    python src/main.py --step load                       # chargement + filtre
-    python src/main.py --step match                      # jointure + allocation
-    python src/main.py --step export                     # GeoJSON/CSV
-    python src/main.py --step visualize                  # carte PNG
-    python src/main.py --step compare                    # comparaison Filosofi vs IRIS
-    python src/main.py --step all --verbose              # logs détaillés
+    python -m src.main --step all                                   # Filosofi
+    python -m src.main --step all --source iris --communes 38185,38151,...
+    python -m src.main --step all --source iris --communes-file data/communes.txt
+    python -m src.main --step load --source iris --communes 38185
+    python -m src.main --step match
+    python -m src.main --step export
+    python -m src.main --step visualize
+    python -m src.main --step compare
+    python -m src.main --step all --verbose
 """
 
 import argparse
@@ -25,6 +26,7 @@ INSEE_SHP = DATA_DIR / "insee_metro_grenoble.shp"
 
 # Fichiers intermédiaires — communs aux deux sources
 BUILDINGS_GPKG = PROCESSED_DIR / "buildings.gpkg"
+STUDY_AREA_GPKG = PROCESSED_DIR / "study_area.gpkg"
 
 # Fichiers intermédiaires — spécifiques à chaque source
 INSEE_GPKG = PROCESSED_DIR / "insee.gpkg"
@@ -49,39 +51,58 @@ def _source_paths(source: str) -> tuple[Path, Path]:
 
 # ── Steps ─────────────────────────────────────────────────────────────────────
 
-def step_load(verbose: bool = False, source: str = "filosofi") -> None:
-    """Load + filter buildings and population grid, save intermediates."""
+def step_load(
+    verbose: bool = False,
+    source: str = "filosofi",
+    commune_codes: list[str] | None = None,
+) -> None:
+    """Load + filter buildings and population grid, save intermediates.
+
+    Avec --source iris et --communes, la zone d'étude est définie par l'union
+    des IRIS des communes choisies. Les bâtiments sont filtrés spatialement.
+    """
     import logging
     _setup_logging(verbose)
     log = logging.getLogger(__name__)
 
+    import geopandas as gpd
     from src.loaders.buildings import load_buildings
     log.info("=== STEP load (source=%s) ===", source)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Bâtiments — communs aux deux sources
-    if not BUILDINGS_GPKG.exists():
-        log.info("Chargement des bâtiments : %s", BUILDINGS_SHP)
-        buildings = load_buildings(BUILDINGS_SHP)
-        buildings.to_file(BUILDINGS_GPKG, driver="GPKG")
-        log.info("%d bâtiments résidentiels sauvegardés -> %s", len(buildings), BUILDINGS_GPKG)
-    else:
-        log.info("Bâtiments déjà chargés : %s", BUILDINGS_GPKG)
-
-    # Grille de population
+    # ── Grille de population (chargée en premier pour définir la zone d'étude)
     grid_gpkg, _ = _source_paths(source)
+    study_area = None
 
     if source == "iris":
         from src.loaders.iris import load_iris
-        log.info("Chargement des IRIS INSEE 2022 (téléchargement auto si nécessaire)…")
-        grid = load_iris()
+        log.info("Chargement des IRIS INSEE 2022 (téléchargement auto si nécessaire)...")
+        if commune_codes:
+            log.info("Communes sélectionnées : %s", ", ".join(commune_codes))
+        grid = load_iris(commune_codes=commune_codes)
+        grid.to_file(grid_gpkg, driver="GPKG")
+        log.info("%d IRIS sauvegardés -> %s", len(grid), grid_gpkg)
+
+        # Zone d'étude = union des IRIS sélectionnés
+        study_area = gpd.GeoDataFrame(geometry=[grid.union_all()], crs=grid.crs)
+        study_area.to_file(STUDY_AREA_GPKG, driver="GPKG")
+        log.info("Zone d'étude sauvegardée -> %s", STUDY_AREA_GPKG)
+
     else:
         from src.loaders.insee import load_insee
         log.info("Chargement des carreaux INSEE Filosofi : %s", INSEE_SHP)
         grid = load_insee(INSEE_SHP)
+        grid.to_file(grid_gpkg, driver="GPKG")
+        log.info("%d carreaux sauvegardés -> %s", len(grid), grid_gpkg)
 
-    grid.to_file(grid_gpkg, driver="GPKG")
-    log.info("%d entités sauvegardées -> %s", len(grid), grid_gpkg)
+    # ── Bâtiments (re-chargés si une zone d'étude est définie, sinon cache)
+    if BUILDINGS_GPKG.exists() and study_area is None:
+        log.info("Bâtiments déjà chargés : %s", BUILDINGS_GPKG)
+    else:
+        log.info("Chargement des bâtiments : %s", BUILDINGS_SHP)
+        buildings = load_buildings(BUILDINGS_SHP, study_area=study_area)
+        buildings.to_file(BUILDINGS_GPKG, driver="GPKG")
+        log.info("%d bâtiments résidentiels sauvegardés -> %s", len(buildings), BUILDINGS_GPKG)
 
 
 def step_match(verbose: bool = False, source: str = "filosofi") -> None:
@@ -166,13 +187,17 @@ def step_compare(verbose: bool = False, source: str = "filosofi") -> None:
     log.info("Validation terminée : %s", out)
 
 
-def step_all(verbose: bool = False, source: str = "filosofi") -> None:
+def step_all(
+    verbose: bool = False,
+    source: str = "filosofi",
+    commune_codes: list[str] | None = None,
+) -> None:
     """Run the full pipeline end-to-end."""
     import logging
     _setup_logging(verbose)
     logging.getLogger(__name__).info("=== PIPELINE COMPLET (source=%s) ===", source)
 
-    step_load(verbose, source)
+    step_load(verbose, source, commune_codes)
     step_match(verbose, source)
     step_export(verbose, source)
     step_visualize(verbose, source)
@@ -184,10 +209,20 @@ def _require(path: Path, prerequisite_step: str) -> None:
     if not path.exists():
         print(
             f"[ERREUR] Fichier intermédiaire manquant : {path}\n"
-            f"         Lancez d'abord : python src/main.py --step {prerequisite_step}",
+            f"         Lancez d'abord : python -m src.main --step {prerequisite_step}",
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _parse_communes(args: argparse.Namespace) -> list[str] | None:
+    """Resolve --communes / --communes-file into a list of commune codes."""
+    if args.communes_file:
+        path = Path(args.communes_file)
+        return [l.strip() for l in path.read_text().splitlines() if l.strip()]
+    if args.communes:
+        return [c.strip() for c in args.communes.split(",") if c.strip()]
+    return None
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -204,7 +239,7 @@ _STEPS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Distribue la population INSEE aux bâtiments résidentiels grenoblois."
+        description="Distribue la population INSEE aux bâtiments résidentiels."
     )
     parser.add_argument(
         "--step",
@@ -219,12 +254,30 @@ def main() -> None:
         help="Source de données de population (default: filosofi).",
     )
     parser.add_argument(
+        "--communes",
+        default=None,
+        help="Codes INSEE communes séparés par virgule (ex: 38185,38151). "
+             "Utilisé avec --source iris pour définir la zone d'étude.",
+    )
+    parser.add_argument(
+        "--communes-file",
+        default=None,
+        metavar="FILE",
+        help="Fichier texte avec un code commune par ligne.",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Active les logs DEBUG.",
     )
     args = parser.parse_args()
-    _STEPS[args.step](verbose=args.verbose, source=args.source)
+    commune_codes = _parse_communes(args)
+
+    step_fn = _STEPS[args.step]
+    if args.step in ("load", "all"):
+        step_fn(verbose=args.verbose, source=args.source, commune_codes=commune_codes)
+    else:
+        step_fn(verbose=args.verbose, source=args.source)
 
 
 if __name__ == "__main__":

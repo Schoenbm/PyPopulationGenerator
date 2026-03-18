@@ -24,8 +24,18 @@ def _fix_encoding(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
-def load_buildings(path: str | Path) -> gpd.GeoDataFrame:
-    """Charge le shapefile bâtiments, filtre les résidentiels et estime NB_LOGTS."""
+def load_buildings(
+    path: str | Path,
+    study_area: "gpd.GeoDataFrame | None" = None,
+) -> gpd.GeoDataFrame:
+    """Charge le shapefile bâtiments, filtre les résidentiels et estime NB_LOGTS.
+
+    Args:
+        path:       Chemin vers le shapefile bâtiments.
+        study_area: GeoDataFrame d'une seule géométrie (union des IRIS choisis).
+                    Si fourni, seuls les bâtiments dont le centroïde se trouve
+                    dans la zone d'étude sont conservés.
+    """
     path = Path(path)
     logger.info("Chargement des bâtiments depuis %s", path)
 
@@ -33,11 +43,38 @@ def load_buildings(path: str | Path) -> gpd.GeoDataFrame:
     gdf = _fix_encoding(gdf)
     logger.info("CRS : %s — %d bâtiments au total", gdf.crs, len(gdf))
 
+    if study_area is not None:
+        gdf = _filter_by_study_area(gdf, study_area)
+
     gdf = filter_residential(gdf)
     logger.info("%d bâtiments résidentiels conservés", len(gdf))
 
     gdf = estimate_nb_logts(gdf)
     return gdf
+
+
+def _filter_by_study_area(
+    gdf: gpd.GeoDataFrame,
+    study_area: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Filtre les bâtiments dont le centroïde est dans la zone d'étude."""
+    if gdf.crs != study_area.crs:
+        study_area = study_area.to_crs(gdf.crs)
+
+    centroids = gdf.copy()
+    centroids["geometry"] = gdf.geometry.centroid
+
+    mask = centroids.sjoin(
+        study_area[["geometry"]],
+        how="inner",
+        predicate="within",
+    ).index
+
+    filtered = gdf.loc[gdf.index.isin(mask)].copy()
+    logger.info(
+        "Filtre zone d'etude : %d -> %d batiments", len(gdf), len(filtered)
+    )
+    return filtered
 
 
 def filter_residential(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
