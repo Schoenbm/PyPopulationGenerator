@@ -101,7 +101,7 @@ def _load_csv_from_zip(url: str, cache_name: str, dep_code: str) -> pd.DataFrame
 # ── Public loader ─────────────────────────────────────────────────────────────
 
 def load_iris(
-    commune_codes: list[str] | None = None,
+    iris_codes: list[str] | None = None,
     dep_code: str = _DEFAULT_DEP,
 ) -> gpd.GeoDataFrame:
     """Load IRIS geometries + 2022 census population.
@@ -113,10 +113,10 @@ def load_iris(
     - taille_moy_menage : average household size (P22_POP / P22_MEN)
 
     Args:
-        commune_codes: Liste de codes INSEE commune (ex. ["38185", "38151"]).
-                       Si fournie, filtre les IRIS de ces communes uniquement.
-                       Si absente, filtre par dep_code (département entier).
-        dep_code:      Code département de secours (default "38" = Isère).
+        iris_codes: Liste de codes IRIS à 9 chiffres (ex. ["381850101", "381850102"]).
+                    Si fournie, filtre sur ces IRIS uniquement.
+                    Si absente, filtre par dep_code (département entier).
+        dep_code:   Code département de secours (default "38" = Isère).
 
     Returns:
         GeoDataFrame avec une ligne par IRIS.
@@ -128,16 +128,18 @@ def load_iris(
     gdf = gpd.read_file(shp_path)
     logger.info("CONTOURS-IRIS chargés : %d IRIS (France entière)", len(gdf))
 
-    if commune_codes:
-        gdf = gdf[gdf["INSEE_COM"].isin(commune_codes)].copy()
-        logger.info("Filtré sur %d communes : %d IRIS", len(commune_codes), len(gdf))
+    if iris_codes:
+        gdf = gdf[gdf["CODE_IRIS"].isin(iris_codes)].copy()
+        logger.info("Filtré sur %d codes IRIS : %d trouvés", len(iris_codes), len(gdf))
+        if len(gdf) < len(iris_codes):
+            missing = set(iris_codes) - set(gdf["CODE_IRIS"])
+            logger.warning("%d codes IRIS non trouvés : %s", len(missing), sorted(missing))
     else:
         gdf = gdf[gdf["CODE_IRIS"].str.startswith(dep_code)].copy()
         logger.info("Filtré dept %s : %d IRIS", dep_code, len(gdf))
 
-    # 2. Population par IRIS (INSEE RP 2022)
-    # Toujours filtrer par dept pour le CSV (plus simple et suffisant)
-    csv_dep = commune_codes[0][:2] if commune_codes else dep_code
+    # 2. Population par IRIS (INSEE RP 2022) — filtrage CSV par département
+    csv_dep = iris_codes[0][:2] if iris_codes else dep_code
     pop = _load_csv_from_zip(_POP_URL, "base-ic-pop-2022.zip", csv_dep)
     log = _load_csv_from_zip(_LOG_URL, "base-ic-logement-2022.zip", csv_dep)
 

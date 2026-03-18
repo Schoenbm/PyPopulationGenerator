@@ -163,15 +163,15 @@ class TestLoadIris:
         assert "taille_moy_menage" in result.columns
         assert "geometry" in result.columns
 
-    def test_filter_by_commune_codes(self, tmp_path):
+    def test_filter_by_iris_codes(self, tmp_path):
         iris_shp, pop_zip, log_zip = self._patch_all(tmp_path)
         with (
             patch("src.loaders.iris._download", side_effect=[tmp_path / "fake.7z", pop_zip, log_zip]),
             patch("src.loaders.iris._extract_contours_7z", return_value="unused"),
             patch("src.loaders.iris.gpd.read_file", return_value=iris_shp),
         ):
-            result = load_iris(commune_codes=["38123"])
-        assert len(result) == 2  # les 2 IRIS de la commune 38123
+            result = load_iris(iris_codes=["381230000"])
+        assert len(result) == 1  # un seul IRIS correspondant
 
     def test_ind_total_matches_p22_pop(self, tmp_path):
         iris_shp, pop_zip, log_zip = self._patch_all(tmp_path)

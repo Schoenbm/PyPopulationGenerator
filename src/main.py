@@ -54,12 +54,12 @@ def _source_paths(source: str) -> tuple[Path, Path]:
 def step_load(
     verbose: bool = False,
     source: str = "filosofi",
-    commune_codes: list[str] | None = None,
+    iris_codes: list[str] | None = None,
 ) -> None:
     """Load + filter buildings and population grid, save intermediates.
 
-    Avec --source iris et --communes, la zone d'étude est définie par l'union
-    des IRIS des communes choisies. Les bâtiments sont filtrés spatialement.
+    Avec --source iris et --iris, la zone d'étude est définie par l'union
+    des IRIS fournis. Les bâtiments sont filtrés spatialement par cette zone.
     """
     import logging
     _setup_logging(verbose)
@@ -77,9 +77,9 @@ def step_load(
     if source == "iris":
         from src.loaders.iris import load_iris
         log.info("Chargement des IRIS INSEE 2022 (téléchargement auto si nécessaire)...")
-        if commune_codes:
-            log.info("Communes sélectionnées : %s", ", ".join(commune_codes))
-        grid = load_iris(commune_codes=commune_codes)
+        if iris_codes:
+            log.info("%d codes IRIS fournis", len(iris_codes))
+        grid = load_iris(iris_codes=iris_codes)
         grid.to_file(grid_gpkg, driver="GPKG")
         log.info("%d IRIS sauvegardés -> %s", len(grid), grid_gpkg)
 
@@ -190,14 +190,14 @@ def step_compare(verbose: bool = False, source: str = "filosofi") -> None:
 def step_all(
     verbose: bool = False,
     source: str = "filosofi",
-    commune_codes: list[str] | None = None,
+    iris_codes: list[str] | None = None,
 ) -> None:
     """Run the full pipeline end-to-end."""
     import logging
     _setup_logging(verbose)
     logging.getLogger(__name__).info("=== PIPELINE COMPLET (source=%s) ===", source)
 
-    step_load(verbose, source, commune_codes)
+    step_load(verbose, source, iris_codes)
     step_match(verbose, source)
     step_export(verbose, source)
     step_visualize(verbose, source)
@@ -215,13 +215,13 @@ def _require(path: Path, prerequisite_step: str) -> None:
         sys.exit(1)
 
 
-def _parse_communes(args: argparse.Namespace) -> list[str] | None:
-    """Resolve --communes / --communes-file into a list of commune codes."""
-    if args.communes_file:
-        path = Path(args.communes_file)
+def _parse_iris(args: argparse.Namespace) -> list[str] | None:
+    """Resolve --iris / --iris-file into a list of IRIS codes."""
+    if args.iris_file:
+        path = Path(args.iris_file)
         return [l.strip() for l in path.read_text().splitlines() if l.strip()]
-    if args.communes:
-        return [c.strip() for c in args.communes.split(",") if c.strip()]
+    if args.iris:
+        return [c.strip() for c in args.iris.split(",") if c.strip()]
     return None
 
 
@@ -254,16 +254,16 @@ def main() -> None:
         help="Source de données de population (default: filosofi).",
     )
     parser.add_argument(
-        "--communes",
+        "--iris",
         default=None,
-        help="Codes INSEE communes séparés par virgule (ex: 38185,38151). "
+        help="Codes IRIS à 9 chiffres séparés par virgule (ex: 381850101,381850102). "
              "Utilisé avec --source iris pour définir la zone d'étude.",
     )
     parser.add_argument(
-        "--communes-file",
+        "--iris-file",
         default=None,
         metavar="FILE",
-        help="Fichier texte avec un code commune par ligne.",
+        help="Fichier texte avec un code IRIS par ligne.",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -271,11 +271,11 @@ def main() -> None:
         help="Active les logs DEBUG.",
     )
     args = parser.parse_args()
-    commune_codes = _parse_communes(args)
+    iris_codes = _parse_iris(args)
 
     step_fn = _STEPS[args.step]
     if args.step in ("load", "all"):
-        step_fn(verbose=args.verbose, source=args.source, commune_codes=commune_codes)
+        step_fn(verbose=args.verbose, source=args.source, iris_codes=iris_codes)
     else:
         step_fn(verbose=args.verbose, source=args.source)
 
